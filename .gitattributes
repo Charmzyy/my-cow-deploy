@@ -1,0 +1,5 @@
+# These run on Linux: a Windows CRLF line ending breaks bash ("$'\r': command not found")
+*.sh       text eol=lf
+Caddyfile  text eol=lf
+*.yml      text eol=lf
+.env*      text eol=lf

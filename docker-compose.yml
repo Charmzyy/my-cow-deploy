@@ -1,0 +1,105 @@
+# PRODUCTION compose for the VPS (/srv/mycow). No source code, no builds: every image is pulled
+# from Docker Hub at the tag named in .env (REST_TAG / CLIENT_TAG / PY_TAG). deploy.sh changes those.
+#
+#   Internet ─80/443─> caddy (HTTPS) ─> client (nginx + Vue) ─/api,/storage─> app (Laravel) ─> mysql
+#                                                                              └─> model (TensorFlow)
+# Only caddy publishes ports. MySQL and the model are reachable only inside this compose network.
+#
+#   docker compose up -d                                   start / apply changes
+#   docker compose exec app php artisan migrate --force    after a first start or a manual image change
+#   ./deploy.sh rest v15                                   what GitHub Actions runs on a new tag
+
+name: mycow   # fixes volume names (mycow_mysql_data, mycow_uploads) for backup.sh / restore.sh
+
+x-logging: &logging
+  # Docker keeps container logs forever by default; cap them so they can't fill the disk
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    ports:
+      - "80:80"          # Let's Encrypt challenge + redirect to https
+      - "443:443"
+      - "443:443/udp"    # HTTP/3
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # certificates: keep, or Let's Encrypt rate-limits you after re-issuing
+      - caddy_config:/config
+    depends_on:
+      - client
+    restart: unless-stopped
+    logging: *logging
+
+  client:
+    image: ${HUB_USER}/cow-client:${CLIENT_TAG:?Set CLIENT_TAG in .env}
+    environment:
+      API_UPSTREAM: http://app:8001
+    depends_on:
+      - app
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+    logging: *logging
+
+  app:
+    image: ${HUB_USER}/cow-rest:${REST_TAG:?Set REST_TAG in .env}
+    env_file: .env
+    environment:
+      # artisan serve answers one request at a time by default; a slow breed prediction would block
+      # everyone. Stopgap until the image moves to php-fpm / FrankenPHP.
+      PHP_CLI_SERVER_WORKERS: "4"
+    volumes:
+      - uploads:/app/storage/app/public
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *logging
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      MYSQL_DATABASE: ${DB_DATABASE:?Set DB_DATABASE in .env}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    logging: *logging
+
+  model:
+    image: ${HUB_USER}/cow-py:${PY_TAG:?Set PY_TAG in .env}
+    healthcheck:
+      # slim image has no curl; TensorFlow takes a while to load the model, hence start_period
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  mysql_data:
+  uploads:
+  caddy_data:
+  caddy_config:
